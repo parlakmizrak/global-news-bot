@@ -1,0 +1,30 @@
+          FEEDS = {
+              "Zeteo": "https://zeteo.com/feed",
+              "Al Jazeera": "https://www.aljazeera.com/xml/rss/all.xml",
+
+              "Anadolu Agency (Türkçe)": "https://www.aa.com.tr/tr/rss/default?cat=dunya",
+              "Daily Sabah": "https://www.dailysabah.com/rss",
+
+              "Press TV": "https://www.presstv.co.uk/rss.xml",
+              "Mehr News": "https://en.mehrnews.com/rss",
+
+              "Express Tribune (Pakistan)": "https://tribune.com.pk/feed/home",
+              "The Daily Star (Bangladesh)": "https://www.thedailystar.net/frontpage/rss.xml",
+
+              "Malay Mail": "https://www.malaymail.com/feed/rss/malaysia",
+              "Free Malaysia Today": "https://www.freemalaysiatoday.com/feed/",
+              "Antara News (Indonesia)": "https://en.antaranews.com/rss/news.xml",
+              "Republika (Indonesia)": "https://www.republika.co.id/rss",
+
+              "Kabar (Kyrgyzstan)": "https://kabar.kg/rss.xml",
+              "Trend News (Azerbaijan)": "https://www.trend.az/rss/",
+              "TASS": "https://tass.com/rss/v2.xml",
+
+              "Daily Trust (Nigeria)": "https://dailytrust.com/feed/",
+              "Morocco World News": "https://www.moroccoworldnews.com/feed/",
+              "Sarajevo Times": "https://sarajevotimes.com/feed/",
+
+              "MercoPress": "https://en.mercopress.com/rss/",
+              "RNZ World": "https://www.rnz.co.nz/rss/world.xml",
+     
+          }
