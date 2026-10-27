@@ -1,30 +1,168 @@
+name: News Bot
+
+on:
+  schedule:
+    - cron: "7 */2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: news-bot
+  cancel-in-progress: false
+
+jobs:
+  post-news:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install feed parser
+        run: pip install feedparser
+      - name: Post new articles
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
+        run: |
+          python - <<'PY'
+          import calendar
+          import json
+          import os
+          import time
+          from concurrent.futures import ThreadPoolExecutor
+          from pathlib import Path
+          from urllib.parse import urlencode, urlparse
+          from urllib.request import Request, urlopen
+
+          import feedparser
+
           FEEDS = {
               "Zeteo": "https://zeteo.com/feed",
               "Al Jazeera": "https://www.aljazeera.com/xml/rss/all.xml",
-
               "Anadolu Agency (Türkçe)": "https://www.aa.com.tr/tr/rss/default?cat=dunya",
               "Daily Sabah": "https://www.dailysabah.com/rss",
-
               "Press TV": "https://www.presstv.co.uk/rss.xml",
               "Mehr News": "https://en.mehrnews.com/rss",
-
               "Express Tribune (Pakistan)": "https://tribune.com.pk/feed/home",
               "The Daily Star (Bangladesh)": "https://www.thedailystar.net/frontpage/rss.xml",
-
               "Malay Mail": "https://www.malaymail.com/feed/rss/malaysia",
               "Free Malaysia Today": "https://www.freemalaysiatoday.com/feed/",
               "Antara News (Indonesia)": "https://en.antaranews.com/rss/news.xml",
               "Republika (Indonesia)": "https://www.republika.co.id/rss",
-
               "Kabar (Kyrgyzstan)": "https://kabar.kg/rss.xml",
               "Trend News (Azerbaijan)": "https://www.trend.az/rss/",
               "TASS": "https://tass.com/rss/v2.xml",
-
               "Daily Trust (Nigeria)": "https://dailytrust.com/feed/",
               "Morocco World News": "https://www.moroccoworldnews.com/feed/",
               "Sarajevo Times": "https://sarajevotimes.com/feed/",
-
               "MercoPress": "https://en.mercopress.com/rss/",
               "RNZ World": "https://www.rnz.co.nz/rss/world.xml",
-     
           }
+          MAX_POSTS = 8
+          MAX_PER_SOURCE = 2
+
+          def fetch(feed):
+              name, url = feed
+              try:
+                  request = Request(url, headers={"User-Agent": "PersonalNewsBot/1.0"})
+                  with urlopen(request, timeout=25) as response:
+                      parsed = feedparser.loads(response.read())
+              except Exception as error:
+                  print(f"{name}: feed unavailable ({error})")
+                  return []
+              articles = []
+              for entry in parsed.entries[:40]:
+                  title = " ".join(str(entry.get("title", "")).split())
+                  link = str(entry.get("link", "")).strip()
+                  if not title or urlparse(link).scheme not in ("http", "https"):
+                      continue
+                  parsed_time = entry.get("published_parsed") or entry.get("updated_parsed")
+                  timestamp = calendar.timegm(parsed_time) if parsed_time else 0
+                  articles.append({
+                      "key": str(entry.get("id") or link),
+                      "title": title[:1000],
+                      "link": link,
+                      "source": name,
+                      "time": timestamp,
+                  })
+              print(f"{name}: {len(articles)} articles")
+              return articles
+
+          def send(article, token, channel):
+              text = f"{article['title']}\n\nSource: {article['source']}\n{article['link']}"
+              data = urlencode({"chat_id": channel, "text": text}).encode()
+              request = Request(
+                  f"https://api.telegram.org/bot{token}/sendMessage", data=data
+              )
+              try:
+                  with urlopen(request, timeout=25) as response:
+                      result = json.loads(response.read())
+                  if not result.get("ok"):
+                      print(f"Telegram rejected a post: {result}")
+                      return False
+                  return True
+              except Exception as error:
+                  print(f"Telegram post failed: {error}")
+                  return False
+
+          token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+          channel = os.environ.get("CHANNEL_ID", "")
+          if not token or not channel:
+              raise SystemExit("Telegram secrets are missing")
+
+          state_path = Path("state.json")
+          if state_path.exists():
+              seen = set(json.loads(state_path.read_text()).get("seen", []))
+          else:
+              seen = set()
+
+          articles = []
+          with ThreadPoolExecutor(max_workers=6) as pool:
+              for result in pool.map(fetch, FEEDS.items()):
+                  articles.extend(result)
+          articles.sort(key=lambda article: article["time"], reverse=True)
+
+          fresh = []
+          batch_keys = set()
+          for article in articles:
+              if article["key"] not in seen and article["key"] not in batch_keys:
+                  fresh.append(article)
+                  batch_keys.add(article["key"])
+
+          selected = []
+          source_counts = {}
+          for article in fresh:
+              source = article["source"]
+              if source_counts.get(source, 0) >= MAX_PER_SOURCE:
+                  continue
+              selected.append(article)
+              source_counts[source] = source_counts.get(source, 0) + 1
+              if len(selected) >= MAX_POSTS:
+                  break
+          selected_keys = {article["key"] for article in selected}
+          for article in fresh:
+              if article["key"] not in selected_keys:
+                  seen.add(article["key"])
+
+          posted = 0
+          for article in selected:
+              if send(article, token, channel):
+                  seen.add(article["key"])
+                  posted += 1
+                  time.sleep(1)
+
+          state_path.write_text(json.dumps({"seen": sorted(seen)[-5000:]}, indent=2))
+          print(f"Posted {posted} articles; skipped {len(fresh) - posted} older backlog items")
+          PY
+      - name: Save processed article IDs
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state.json
+          if ! git diff --cached --quiet; then
+            git commit -m "Update processed articles"
+            git push
+          fi
