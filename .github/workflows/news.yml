@@ -69,7 +69,7 @@ jobs:
               try:
                   request = Request(url, headers={"User-Agent": "PersonalNewsBot/1.0"})
                   with urlopen(request, timeout=25) as response:
-                      parsed = feedparser.loads(response.read())
+                      parsed = feedparser.parse(response.read())
               except Exception as error:
                   print(f"{name}: feed unavailable ({error})")
                   return []
