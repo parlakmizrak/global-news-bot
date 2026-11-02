@@ -1,168 +1,296 @@
-name: News Bot
+name: Global News Bot
 
 on:
   schedule:
-    - cron: "7 */2 * * *"
+    # 10:00 in Türkiye (UTC+3), once daily
+    - cron: "0 7 * * *"
   workflow_dispatch:
 
 permissions:
   contents: write
 
-concurrency:
-  group: news-bot
-  cancel-in-progress: false
-
 jobs:
   post-news:
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
       - name: Install feed parser
         run: pip install feedparser
-      - name: Post new articles
+
+      - name: Post daily regional headlines
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
         run: |
           python - <<'PY'
           import calendar
+          import html
           import json
           import os
           import time
-          from concurrent.futures import ThreadPoolExecutor
+          import urllib.request
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          from datetime import datetime, timedelta, timezone
           from pathlib import Path
-          from urllib.parse import urlencode, urlparse
-          from urllib.request import Request, urlopen
 
           import feedparser
 
-          FEEDS = {
-              "Zeteo": "https://zeteo.com/feed",
-              "Al Jazeera": "https://www.aljazeera.com/xml/rss/all.xml",
-              "Anadolu Agency (Türkçe)": "https://www.aa.com.tr/tr/rss/default?cat=dunya",
-              "Daily Sabah": "https://www.dailysabah.com/rss",
-              "Press TV": "https://www.presstv.co.uk/rss.xml",
-              "Mehr News": "https://en.mehrnews.com/rss",
-              "Express Tribune (Pakistan)": "https://tribune.com.pk/feed/home",
-              "The Daily Star (Bangladesh)": "https://www.thedailystar.net/frontpage/rss.xml",
-              "Malay Mail": "https://www.malaymail.com/feed/rss/malaysia",
-              "Free Malaysia Today": "https://www.freemalaysiatoday.com/feed/",
-              "Antara News (Indonesia)": "https://en.antaranews.com/rss/news.xml",
-              "Republika (Indonesia)": "https://www.republika.co.id/rss",
-              "Kabar (Kyrgyzstan)": "https://kabar.kg/rss.xml",
-              "Trend News (Azerbaijan)": "https://www.trend.az/rss/",
-              "TASS": "https://tass.com/rss/v2.xml",
-              "Daily Trust (Nigeria)": "https://dailytrust.com/feed/",
-              "Morocco World News": "https://www.moroccoworldnews.com/feed/",
-              "Sarajevo Times": "https://sarajevotimes.com/feed/",
-              "MercoPress": "https://en.mercopress.com/rss/",
-              "RNZ World": "https://www.rnz.co.nz/rss/world.xml",
+          MAX_POSTS = 18
+          STATE_FILE = Path("state.json")
+
+          # Two slots per confirmed zone; no zone can dominate the digest.
+          REGION_LIMITS = {
+              "Africa": 2,
+              "Middle East": 2,
+              "Central Asia": 2,
+              "South Asia": 2,
+              "Southeast Asia": 2,
+              "Europe and Russia": 2,
+              "North America": 2,
+              "South America": 2,
+              "Oceania": 2,
           }
-          MAX_POSTS = 8
-          MAX_PER_SOURCE = 2
 
-          def fetch(feed):
-              name, url = feed
+          FEEDS = {
+              "Africa": {
+                  "Africanews": "https://www.africanews.com/feed/rss",
+                  "Daily Trust": "https://dailytrust.com/feed/",
+                  "Morocco World News": "https://www.moroccoworldnews.com/feed",
+                  "Daily Maverick": "https://www.dailymaverick.co.za/feed/",
+              },
+              "Middle East": {
+                  "Al Jazeera": "https://www.aljazeera.com/xml/rss/all.xml",
+                  "Anadolu Agency": "https://www.aa.com.tr/tr/rss/default?cat=dunya",
+                  "Daily Sabah": "https://www.dailysabah.com/rss",
+                  "Press TV": "https://www.presstv.ir/rss.xml",
+                  "Mehr News": "https://en.mehrnews.com/rss",
+              },
+              "Central Asia": {
+                  "Kabar": "https://en.kabar.kg/rss/",
+                  "Daryo": "https://daryo.uz/en/feed",
+                  "Kun.uz": "https://kun.uz/news/rss",
+                  "Pressa Tajikistan": "https://pressa.tj/ru/feed",
+              },
+              "South Asia": {
+                  "Express Tribune": "https://tribune.com.pk/feed/home",
+                  "The Daily Star": "https://www.thedailystar.net/frontpage/rss.xml",
+              },
+              "Southeast Asia": {
+                  "Malay Mail": "https://www.malaymail.com/feed/rss/malaysia",
+                  "Free Malaysia Today": "https://www.freemalaysiatoday.com/feed/",
+              },
+              "Europe and Russia": {
+                  "TASS": "https://tass.com/rss/v2.xml",
+                  "Sarajevo Times": "https://sarajevotimes.com/feed/",
+              },
+              "North America": {
+                  "Zeteo": "https://zeteo.com/feed",
+                  "CBC": "https://www.cbc.ca/webfeed/rss/rss-topstories",
+              },
+              "South America": {
+                  "MercoPress": "https://en.mercopress.com/rss/",
+                  "The Rio Times": "https://www.riotimesonline.com/feed/",
+              },
+              "Oceania": {
+                  "RNZ News": "https://www.rnz.co.nz/rss/news.xml",
+                  "ABC News Australia": "https://www.abc.net.au/news/feed/46182/rss.xml",
+              },
+          }
+
+          if STATE_FILE.exists():
               try:
-                  request = Request(url, headers={"User-Agent": "PersonalNewsBot/1.0"})
-                  with urlopen(request, timeout=25) as response:
-                      parsed = feedparser.parse(response.read())
-              except Exception as error:
-                  print(f"{name}: feed unavailable ({error})")
-                  return []
-              articles = []
-              for entry in parsed.entries[:40]:
-                  title = " ".join(str(entry.get("title", "")).split())
-                  link = str(entry.get("link", "")).strip()
-                  if not title or urlparse(link).scheme not in ("http", "https"):
-                      continue
-                  parsed_time = entry.get("published_parsed") or entry.get("updated_parsed")
-                  timestamp = calendar.timegm(parsed_time) if parsed_time else 0
-                  articles.append({
-                      "key": str(entry.get("id") or link),
-                      "title": title[:1000],
-                      "link": link,
-                      "source": name,
-                      "time": timestamp,
-                  })
-              print(f"{name}: {len(articles)} articles")
-              return articles
-
-          def send(article, token, channel):
-              text = f"{article['title']}\n\nSource: {article['source']}\n{article['link']}"
-              data = urlencode({"chat_id": channel, "text": text}).encode()
-              request = Request(
-                  f"https://api.telegram.org/bot{token}/sendMessage", data=data
-              )
-              try:
-                  with urlopen(request, timeout=25) as response:
-                      result = json.loads(response.read())
-                  if not result.get("ok"):
-                      print(f"Telegram rejected a post: {result}")
-                      return False
-                  return True
-              except Exception as error:
-                  print(f"Telegram post failed: {error}")
-                  return False
-
-          token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-          channel = os.environ.get("CHANNEL_ID", "")
-          if not token or not channel:
-              raise SystemExit("Telegram secrets are missing")
-
-          state_path = Path("state.json")
-          if state_path.exists():
-              seen = set(json.loads(state_path.read_text()).get("seen", []))
+                  saved = json.loads(STATE_FILE.read_text(encoding="utf-8-sig"))
+              except (json.JSONDecodeError, OSError):
+                  saved = {}
           else:
-              seen = set()
+              saved = {}
 
-          articles = []
-          with ThreadPoolExecutor(max_workers=6) as pool:
-              for result in pool.map(fetch, FEEDS.items()):
-                  articles.extend(result)
-          articles.sort(key=lambda article: article["time"], reverse=True)
+          if isinstance(saved, list):
+              seen_order = saved
+          elif isinstance(saved, dict):
+              seen_order = []
+              for key in ("seen", "posted_ids", "processed", "articles"):
+                  if isinstance(saved.get(key), list):
+                      seen_order = saved[key]
+                      break
+          else:
+              seen_order = []
 
-          fresh = []
-          batch_keys = set()
-          for article in articles:
-              if article["key"] not in seen and article["key"] not in batch_keys:
-                  fresh.append(article)
-                  batch_keys.add(article["key"])
+          seen_order = [str(item) for item in seen_order]
+          seen = set(seen_order)
+
+          def get_timestamp(entry):
+              value = entry.get("published_parsed") or entry.get("updated_parsed")
+              if value:
+                  try:
+                      return calendar.timegm(value)
+                  except (TypeError, ValueError, OverflowError):
+                      pass
+              return 0
+
+          def fetch_headline(region, source, url):
+              request = urllib.request.Request(
+                  url,
+                  headers={"User-Agent": "Mozilla/5.0 (compatible; DailyNewsBot/1.0)"},
+              )
+              with urllib.request.urlopen(request, timeout=25) as response:
+                  parsed = feedparser.parse(response.read())
+
+              for entry in parsed.entries:
+                  title = " ".join(entry.get("title", "").split())
+                  link = entry.get("link", "").strip()
+                  if not title or not link:
+                      continue
+
+                  article_id = str(entry.get("id") or link)
+                  if article_id in seen or link in seen:
+                      continue
+
+                  return {
+                      "region": region,
+                      "source": source,
+                      "title": title[:350],
+                      "link": link,
+                      "id": article_id,
+                      "timestamp": get_timestamp(entry),
+                  }
+              return None
+
+          candidates = []
+          with ThreadPoolExecutor(max_workers=8) as executor:
+              futures = {}
+              for region, sources in FEEDS.items():
+                  for source, url in sources.items():
+                      future = executor.submit(fetch_headline, region, source, url)
+                      futures[future] = (region, source)
+
+              for future in as_completed(futures):
+                  region, source = futures[future]
+                  try:
+                      article = future.result()
+                      if article:
+                          candidates.append(article)
+                  except Exception as error:
+                      print(f"Feed failed: {source}: {error}")
 
           selected = []
-          source_counts = {}
-          for article in fresh:
-              source = article["source"]
-              if source_counts.get(source, 0) >= MAX_PER_SOURCE:
-                  continue
-              selected.append(article)
-              source_counts[source] = source_counts.get(source, 0) + 1
-              if len(selected) >= MAX_POSTS:
-                  break
-          selected_keys = {article["key"] for article in selected}
-          for article in fresh:
-              if article["key"] not in selected_keys:
-                  seen.add(article["key"])
+          batch_ids = set()
+          batch_links = set()
 
-          posted = 0
-          for article in selected:
-              if send(article, token, channel):
-                  seen.add(article["key"])
-                  posted += 1
-                  time.sleep(1)
+          for region, limit in REGION_LIMITS.items():
+              regional = [item for item in candidates if item["region"] == region]
+              regional.sort(
+                  key=lambda item: (item["timestamp"], item["source"]),
+                  reverse=True,
+              )
+              for article in regional:
+                  if article["id"] in batch_ids or article["link"] in batch_links:
+                      continue
+                  selected.append(article)
+                  batch_ids.add(article["id"])
+                  batch_links.add(article["link"])
+                  if len([item for item in selected if item["region"] == region]) >= limit:
+                      break
+                  if len(selected) >= MAX_POSTS:
+                      break
 
-          state_path.write_text(json.dumps({"seen": sorted(seen)[-5000:]}, indent=2))
-          print(f"Posted {posted} articles; skipped {len(fresh) - posted} older backlog items")
+          if not selected:
+              print("No new headlines found.")
+              raise SystemExit(0)
+
+          turkey_time = datetime.now(timezone(timedelta(hours=3)))
+          header = (
+              "<b>🌍 Daily World Headlines</b>\n"
+              + turkey_time.strftime("%d %B %Y")
+          )
+
+          blocks = []
+          number = 1
+          for region in REGION_LIMITS:
+              regional = [item for item in selected if item["region"] == region]
+              for index, article in enumerate(regional):
+                  region_heading = f"<b>{html.escape(region)}</b>\n" if index == 0 else ""
+                  block = (
+                      region_heading
+                      + f'{number}. <a href="{html.escape(article["link"], quote=True)}">'
+                      + f'{html.escape(article["title"])}</a>\n'
+                      + f'— {html.escape(article["source"])}'
+                  )
+                  blocks.append((block, article))
+                  number += 1
+
+          pages = []
+          current_text = header
+          current_articles = []
+
+          for block, article in blocks:
+              candidate = current_text + "\n\n" + block
+              if len(candidate) > 3900 and current_articles:
+                  pages.append((current_text, current_articles))
+                  current_text = header + "\n<i>Continued</i>"
+                  current_articles = []
+                  candidate = current_text + "\n\n" + block
+              current_text = candidate
+              current_articles.append(article)
+
+          if current_articles:
+              pages.append((current_text, current_articles))
+
+          token = os.environ["TELEGRAM_BOT_TOKEN"]
+          channel = os.environ["CHANNEL_ID"]
+
+          for page_number, (text, posted_articles) in enumerate(pages, start=1):
+              payload = json.dumps({
+                  "chat_id": channel,
+                  "text": text,
+                  "parse_mode": "HTML",
+                  "disable_web_page_preview": True,
+              }).encode("utf-8")
+              request = urllib.request.Request(
+                  f"https://api.telegram.org/bot{token}/sendMessage",
+                  data=payload,
+                  headers={"Content-Type": "application/json"},
+              )
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  result = json.loads(response.read().decode("utf-8"))
+
+              if not result.get("ok"):
+                  raise RuntimeError(f"Telegram rejected the post: {result}")
+
+              for article in posted_articles:
+                  for identifier in (article["id"], article["link"]):
+                      if identifier not in seen:
+                          seen.add(identifier)
+                          seen_order.append(identifier)
+
+              STATE_FILE.write_text(
+                  json.dumps({"seen": seen_order[-5000:]}, ensure_ascii=False, indent=2),
+                  encoding="utf-8",
+              )
+              print(f"Posted page {page_number}/{len(pages)} with {len(posted_articles)} headlines.")
+              time.sleep(0.5)
+
+          print(f"Daily digest complete: {len(selected)} headlines posted.")
           PY
+
       - name: Save processed article IDs
+        if: always()
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add state.json
-          if ! git diff --cached --quiet; then
-            git commit -m "Update processed articles"
-            git push
+          if [ -f state.json ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add state.json
+            if ! git diff --cached --quiet; then
+              git commit -m "Update news state"
+              git pull --rebase origin main
+              git push
+            fi
           fi
