@@ -35,6 +35,7 @@ jobs:
           import html
           import json
           import os
+          import re
           import time
           import urllib.request
           from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -136,6 +137,41 @@ jobs:
                       pass
               return 0
 
+          def get_image(entry):
+              for media in entry.get("media_content", []):
+                  url = media.get("url", "").strip()
+                  media_type = media.get("type", "")
+                  medium = media.get("medium", "")
+                  if url and medium in ("", "image") and (not media_type or media_type.startswith("image/")):
+                      return html.unescape(url)
+
+              for media in entry.get("media_thumbnail", []):
+                  url = media.get("url", "").strip()
+                  if url:
+                      return html.unescape(url)
+
+              for enclosure in entry.get("enclosures", []):
+                  url = (enclosure.get("href") or enclosure.get("url") or "").strip()
+                  media_type = enclosure.get("type", "")
+                  if url and (media_type.startswith("image/") or re.search(r"\.(jpe?g|png|webp)(\?|$)", url, re.I)):
+                      return html.unescape(url)
+
+              image = entry.get("image", {})
+              if isinstance(image, dict) and image.get("href"):
+                  return html.unescape(image["href"].strip())
+
+              content_parts = [entry.get("summary", ""), entry.get("description", "")]
+              for content in entry.get("content", []):
+                  content_parts.append(content.get("value", ""))
+              match = re.search(
+                  r'''<img[^>]+src=["']([^"']+)["']''',
+                  " ".join(content_parts),
+                  re.I,
+              )
+              if match:
+                  return html.unescape(match.group(1))
+              return None
+
           def fetch_headline(region, source, url):
               request = urllib.request.Request(
                   url,
@@ -160,6 +196,7 @@ jobs:
                       "title": title[:350],
                       "link": link,
                       "id": article_id,
+                      "image": get_image(entry),
                       "timestamp": get_timestamp(entry),
                   }
               return None
@@ -210,75 +247,83 @@ jobs:
           header = (
               "<b>🌍 Daily World Headlines</b>\n"
               + turkey_time.strftime("%d %B %Y")
+              + f"\n{len(selected)} headlines • Two per zone when available"
           )
-
-          blocks = []
-          number = 1
-          for region in REGION_LIMITS:
-              regional = [item for item in selected if item["region"] == region]
-              for index, article in enumerate(regional):
-                  region_heading = f"<b>{html.escape(region)}</b>\n" if index == 0 else ""
-                  block = (
-                      region_heading
-                      + f'{number}. <a href="{html.escape(article["link"], quote=True)}">'
-                      + f'{html.escape(article["title"])}</a>\n'
-                      + f'— {html.escape(article["source"])}'
-                  )
-                  blocks.append((block, article))
-                  number += 1
-
-          pages = []
-          current_text = header
-          current_articles = []
-
-          for block, article in blocks:
-              candidate = current_text + "\n\n" + block
-              if len(candidate) > 3900 and current_articles:
-                  pages.append((current_text, current_articles))
-                  current_text = header + "\n<i>Continued</i>"
-                  current_articles = []
-                  candidate = current_text + "\n\n" + block
-              current_text = candidate
-              current_articles.append(article)
-
-          if current_articles:
-              pages.append((current_text, current_articles))
 
           token = os.environ["TELEGRAM_BOT_TOKEN"]
           channel = os.environ["CHANNEL_ID"]
 
-          for page_number, (text, posted_articles) in enumerate(pages, start=1):
-              payload = json.dumps({
-                  "chat_id": channel,
-                  "text": text,
-                  "parse_mode": "HTML",
-                  "disable_web_page_preview": True,
-              }).encode("utf-8")
+          def call_telegram(method, payload):
               request = urllib.request.Request(
-                  f"https://api.telegram.org/bot{token}/sendMessage",
-                  data=payload,
+                  f"https://api.telegram.org/bot{token}/{method}",
+                  data=json.dumps(payload).encode("utf-8"),
                   headers={"Content-Type": "application/json"},
               )
-              with urllib.request.urlopen(request, timeout=30) as response:
+              with urllib.request.urlopen(request, timeout=40) as response:
                   result = json.loads(response.read().decode("utf-8"))
-
               if not result.get("ok"):
-                  raise RuntimeError(f"Telegram rejected the post: {result}")
+                  raise RuntimeError(f"Telegram rejected {method}: {result}")
+              return result
 
-              for article in posted_articles:
-                  for identifier in (article["id"], article["link"]):
-                      if identifier not in seen:
-                          seen.add(identifier)
-                          seen_order.append(identifier)
+          call_telegram("sendMessage", {
+              "chat_id": channel,
+              "text": header,
+              "parse_mode": "HTML",
+              "disable_web_page_preview": True,
+          })
+
+          for number, article in enumerate(selected, start=1):
+              region = html.escape(article["region"])
+              source = html.escape(article["source"])
+              title = html.escape(article["title"])
+              link = html.escape(article["link"], quote=True)
+              caption = (
+                  f"<b>{region}</b>\n"
+                  f'<a href="{link}">{title}</a>\n'
+                  f"— {source}"
+              )
+
+              posted_with_image = False
+              if article.get("image"):
+                  try:
+                      call_telegram("sendPhoto", {
+                          "chat_id": channel,
+                          "photo": article["image"],
+                          "caption": caption,
+                          "parse_mode": "HTML",
+                      })
+                      posted_with_image = True
+                  except RuntimeError as error:
+                      print(f"Photo failed for {article['source']}; using article preview: {error}")
+
+              if not posted_with_image:
+                  preview_text = (
+                      f"<b>{region}</b>\n"
+                      f"{title}\n"
+                      f"— {source}\n"
+                      f"{link}"
+                  )
+                  call_telegram("sendMessage", {
+                      "chat_id": channel,
+                      "text": preview_text,
+                      "parse_mode": "HTML",
+                      "disable_web_page_preview": False,
+                  })
+
+              for identifier in (article["id"], article["link"]):
+                  if identifier not in seen:
+                      seen.add(identifier)
+                      seen_order.append(identifier)
 
               STATE_FILE.write_text(
                   json.dumps({"seen": seen_order[-5000:]}, ensure_ascii=False, indent=2),
                   encoding="utf-8",
               )
-              print(f"Posted page {page_number}/{len(pages)} with {len(posted_articles)} headlines.")
-              time.sleep(0.5)
+              style = "photo" if posted_with_image else "article preview"
+              print(f"Posted {number}/{len(selected)}: {article['source']} ({style}).")
+              time.sleep(1)
 
-          print(f"Daily digest complete: {len(selected)} headlines posted.")
+          print(f"Daily headlines complete: {len(selected)} articles posted.")
           PY
 
       - name: Save processed article IDs
